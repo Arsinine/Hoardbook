@@ -8,7 +8,7 @@
 //! and a relay's per-event accept/reject is surfaced (the `Output.success`/`failed` split) so a
 //! silent drop or an explicit `OK: false` is observable (AB8), never swallowed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,18 @@ const MAX_THROTTLE_SLEEP: Duration = Duration::from_secs(2);
 /// relay's handshake lands in tens of milliseconds, so a 50 ms tick adds at most one tick of
 /// latency to the fast path, while the slow path stays bounded by the join's own `timeout`.
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Handshake budget for one [`RelayClient::redial_terminated_relays`] attempt (QURATOR-385). The
+/// dial is SPAWNED so no caller ever waits on a dead host; this bounds only the background
+/// attempt itself — the same order of magnitude as `connect`'s per-relay budget.
+const REDIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// First re-dial delay after a relay lands in `RelayStatus::Terminated` (QURATOR-385).
+const REDIAL_BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling on the exponential re-dial backoff (QURATOR-385): a relay down for hours is retried
+/// every quarter hour, never more often — but also never abandoned for the session.
+const REDIAL_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
 
 /// A connected multi-relay client.
 pub struct RelayClient {
@@ -50,6 +62,22 @@ pub struct RelayClient {
     /// Monotonic anchor: `start.elapsed()` is the `now` fed to the limiter, so a wall-clock jump
     /// cannot skew pacing.
     start: Instant,
+    /// Re-dial backoff state for relays stuck in `RelayStatus::Terminated` (QURATOR-385), keyed by
+    /// canonical relay URL: `(last_attempt, attempts)`. A failed FIRST handshake sets Terminated
+    /// and spawns NO reconnect task (nostr-relay-pool 0.44.3 `Relay::try_connect`: the
+    /// auto-reconnect loop only exists after a successful connect), and `pool_is_live` stays true
+    /// while any other relay is up — so without this the relay is stranded dead for the whole
+    /// session. Behind a `std::sync::Mutex` for the same reason as `limiter`: the sweep runs off
+    /// `&self` on the shared `Arc` and the critical section is pure bookkeeping held only across
+    /// the decision, never across the `.await`.
+    redial: Mutex<HashMap<String, (Instant, u32)>>,
+    /// Last status reported per configured relay, so [`Self::relay_status`] warns only on the
+    /// TRANSITION into a dead terminal state — not on every call (QURATOR-387: `relay_status` runs
+    /// on the ~12 s Settings poll, and a per-call WARN put one line per poll in the log for a
+    /// single dead relay). A relay leaving the terminal state updates the map via the same insert
+    /// that reads `prev`, so a later re-entry warns again. Behind a `std::sync::Mutex`: the
+    /// critical section is one map insert, never held across an `.await`.
+    last_reported: Mutex<HashMap<String, RelayStatus>>,
 }
 
 /// Per-relay accept/reject split for a single publish.
@@ -237,6 +265,36 @@ pub fn pool_is_live(statuses: &[RelayStatus]) -> bool {
             .any(|s| !matches!(s, RelayStatus::Terminated | RelayStatus::Banned))
 }
 
+/// Backoff delay before the NEXT re-dial of a relay that has already been re-dialed `attempts`
+/// times (QURATOR-385): 30 s after the first, doubling, capped at 15 min. Saturating arithmetic —
+/// a huge `attempts` count (long-lived session against a relay that never comes back) must clamp,
+/// never overflow or shift-panic.
+fn redial_backoff_delay(attempts: u32) -> Duration {
+    if attempts <= 1 {
+        return REDIAL_BACKOFF_BASE;
+    }
+    let shift = (attempts - 1).min(31);
+    REDIAL_BACKOFF_BASE
+        .saturating_mul(1u32 << shift)
+        .min(REDIAL_BACKOFF_CAP)
+}
+
+/// Whether a `Terminated` relay is due for its re-dial at `now` (QURATOR-385). `last_attempt` of
+/// `None` (never re-dialed since this Terminated episode began) is due **immediately**; after that
+/// the spacing doubles per failed attempt, capped at 15 min. Pure, so the schedule is unit-tested
+/// without a relay or a real wait.
+fn redial_due(last_attempt: Option<Instant>, attempts: u32, now: Instant) -> bool {
+    match last_attempt {
+        None => true,
+        // checked_duration_since: `Instant` is monotonic so `now < last` cannot happen in
+        // production, but a deliberate attempt must never panic the sweep either.
+        Some(last) => now
+            .checked_duration_since(last)
+            .unwrap_or_default()
+            >= redial_backoff_delay(attempts),
+    }
+}
+
 /// Whether **any** relay is currently connected (`Connected` only — the state that can actually
 /// serve a REQ). The gap between this and [`pool_is_live`] is exactly the relay-outage hole
 /// (QURATOR-80's class, transient form): `pool_is_live` deliberately counts `Disconnected` as live
@@ -248,6 +306,30 @@ pub fn pool_is_live(statuses: &[RelayStatus]) -> bool {
 /// asked. Pure, so the classification is unit-tested without a relay.
 fn any_relay_connected(statuses: &[RelayStatus]) -> bool {
     statuses.iter().any(|s| matches!(s, RelayStatus::Connected))
+}
+
+/// The relay URLs **not** in a dead terminal state (`Terminated`/`Banned`) — the subset a fetch
+/// may target (QURATOR-386). A `Terminated` relay's connection task is gone, so its channel has no
+/// receiver and targeting it logs "can't send message to the 'nostr' channel" on every call;
+/// `Banned` is the other "no retry will occur" state. Transient states stay in: nostr-sdk owns
+/// them and may reconnect (the same reading [`pool_is_live`] documents). Order-preserving and
+/// pure, so the exclusion is unit-tested without a relay.
+fn fetchable_relays(pool: &[(String, RelayStatus)]) -> Vec<String> {
+    pool.iter()
+        .filter(|(_, s)| !matches!(s, RelayStatus::Terminated | RelayStatus::Banned))
+        .map(|(url, _)| url.clone())
+        .collect()
+}
+
+/// The QURATOR-387 WARN gate: `relay_status()` polls on a ~12 s cadence, so the dead-terminal WARN
+/// must fire on the TRANSITION into `Terminated`/`Banned` — first observation or live→dead — and
+/// stay quiet while the relay REMAINS in that state (the pre-387 per-call WARN put one line per
+/// poll in the log for a single dead relay). Leaving the terminal state is not a WARN either; the
+/// caller logs an INFO there and the map update makes a later re-entry warn again. Pure, so the
+/// full truth table is unit-tested without a relay.
+fn should_warn_terminal(prev: Option<RelayStatus>, now: RelayStatus) -> bool {
+    let terminal = |s: &RelayStatus| matches!(s, RelayStatus::Terminated | RelayStatus::Banned);
+    terminal(&now) && !prev.is_some_and(|p| terminal(&p))
 }
 
 /// The per-tick decision of [`RelayClient::connect`]'s first-success race (QURATOR-168). Pure,
@@ -368,6 +450,8 @@ impl RelayClient {
                         relays: relays.to_vec(),
                         limiter: Mutex::new(RelayRateLimiter::relay_writes()),
                         start: Instant::now(),
+                        redial: Mutex::new(HashMap::new()),
+                        last_reported: Mutex::new(HashMap::new()),
                     });
                 }
                 ConnectRaceDecision::KeepWaiting => {}
@@ -406,6 +490,8 @@ impl RelayClient {
             relays: relays.to_vec(),
             limiter: Mutex::new(RelayRateLimiter::relay_writes()),
             start: Instant::now(),
+            redial: Mutex::new(HashMap::new()),
+            last_reported: Mutex::new(HashMap::new()),
         })
     }
 
@@ -486,7 +572,70 @@ impl RelayClient {
     pub async fn is_live(&self) -> bool {
         let relays = self.client.relays().await;
         let statuses: Vec<RelayStatus> = relays.values().map(|r| r.status()).collect();
+        // QURATOR-385: the Terminated re-dial sweep piggybacks here — both persistent clients
+        // (hb-app `net.rs` shared client, `auto_approve.rs` held client) call `is_live` on every
+        // acquire, so this covers both without any hb-app edit. Non-blocking: the dials are
+        // spawned below; `is_live`'s answer is computed from the statuses exactly as before.
+        self.redial_terminated_relays().await;
         pool_is_live(&statuses)
+    }
+
+    /// Re-dial every pool relay whose status is `RelayStatus::Terminated` (QURATOR-385) and whose
+    /// [`redial_due`] schedule has elapsed, SPAWNING each dial so the caller never waits on a dead
+    /// host. Scope is exact: `Banned` is a deliberate administrative state (never re-dialed), and
+    /// the transient states (`Connecting`/`Disconnected`/…) are nostr-sdk's to own — its
+    /// auto-reconnect loop exists for every relay that has connected once. `Relay::try_connect`
+    /// accepts a `Terminated` relay (`can_connect()` covers it) and — the reason this sweep
+    /// exists — a failed FIRST handshake leaves NO reconnect task behind, so without this the
+    /// relay is stranded dead for the session; one successful redial spawns the normal connection
+    /// task and resurrects it. The backoff entry resets when the relay is next observed
+    /// `Connected`. Lock is held only across the pure decision, never across an `.await`.
+    async fn redial_terminated_relays(&self) {
+        let relays = self.client.relays().await;
+        let now = Instant::now();
+        let mut due = Vec::new();
+        {
+            let mut state = self.redial.lock().expect("redial backoff lock");
+            for (url, relay) in relays.iter() {
+                let canon = canonical_relay_url(&url.to_string());
+                match relay.status() {
+                    RelayStatus::Connected => {
+                        // Healthy again: forget the episode, so the NEXT Terminated one starts a
+                        // fresh immediate redial instead of inheriting a stale backoff.
+                        state.remove(&canon);
+                    }
+                    RelayStatus::Terminated => {
+                        let (last, attempts) =
+                            state.get(&canon).copied().unwrap_or((now, 0));
+                        if redial_due(if attempts == 0 { None } else { Some(last) }, attempts, now) {
+                            let attempt = attempts + 1;
+                            state.insert(canon.clone(), (now, attempt));
+                            due.push((canon, relay.clone(), attempt));
+                        }
+                    }
+                    // Banned is deliberate; every other state is nostr-sdk's to own.
+                    _ => {}
+                }
+            }
+        }
+        for (canon, relay, attempt) in due {
+            tracing::info!(relay = %canon, attempt, "relay redial: re-dialing terminated relay");
+            tokio::spawn(async move {
+                match relay.try_connect(REDIAL_HANDSHAKE_TIMEOUT).await {
+                    Ok(()) => {
+                        tracing::info!(relay = %canon, attempt, "relay redial: handshake succeeded");
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            relay = %canon,
+                            attempt,
+                            error = %e,
+                            "relay redial: handshake failed (backoff will retry)"
+                        );
+                    }
+                }
+            });
+        }
     }
 
     /// Live per-relay reachability for the **configured** relay set (M12 W1, Decision D) — one
@@ -506,11 +655,31 @@ impl RelayClient {
                         // QURATOR-66: a relay dropping to a dead terminal state (Terminated/Banned)
                         // is the SPOF signal — log it at WARN so a user report shows which relay died
                         // and when. The transient Disconnected is DEBUG (nostr-sdk auto-reconnects).
-                        if matches!(s, RelayStatus::Terminated | RelayStatus::Banned) {
+                        // QURATOR-387: this method runs on the ~12 s Settings poll, so the WARN
+                        // fires on the TRANSITION only (`should_warn_terminal` + the map below);
+                        // a relay already in the terminal state is silent until it recovers. The
+                        // same insert records `s` and yields `prev`, and recovery updates the map
+                        // so a later re-entry warns again.
+                        let prev = self
+                            .last_reported
+                            .lock()
+                            .map(|mut m| m.insert(url.clone(), s))
+                            .unwrap_or(None);
+                        if should_warn_terminal(prev, s) {
                             tracing::warn!(
                                 relay = %canonical_relay_url(url),
                                 status = status_label(s),
                                 "relay reached a dead terminal state — it will not auto-reconnect"
+                            );
+                        } else if matches!(
+                            prev,
+                            Some(RelayStatus::Terminated | RelayStatus::Banned)
+                        ) && !matches!(s, RelayStatus::Terminated | RelayStatus::Banned)
+                        {
+                            tracing::info!(
+                                relay = %canonical_relay_url(url),
+                                status = status_label(s),
+                                "relay left the dead terminal state"
                             );
                         } else if s == RelayStatus::Disconnected {
                             tracing::debug!(
@@ -541,13 +710,28 @@ impl RelayClient {
     /// **zero** relays `Connected` the answer cannot have come from any relay, so it is refused.
     /// One-or-more connected relays returning nothing stays `Ok(vec![])` — that IS a genuine
     /// empty, and turning it into an Err would be the opposite bug.
+    ///
+    /// QURATOR-386: the query is scoped to [`fetchable_relays`] — relays in a dead terminal state
+    /// (`Terminated`/`Banned`) are dropped before the query instead of being re-targeted (and
+    /// re-errored against) on every call. A pool that is entirely dead-terminal has nothing left
+    /// to ask and is refused up front as [`NetError::NoRelayConnected`], like any other outage.
     pub async fn fetch(&self, filter: Filter, timeout: Duration) -> Result<Vec<Event>, NetError> {
         if filter.is_empty() {
             return Err(NetError::EmptyFilter);
         }
+        let live = self.client.relays().await;
+        let pool: Vec<(String, RelayStatus)> =
+            live.iter().map(|(u, r)| (u.to_string(), r.status())).collect();
+        let fetchable = fetchable_relays(&pool);
+        if fetchable.is_empty() {
+            return Err(NetError::NoRelayConnected(format!(
+                "0 of {} relay(s) fetchable — the rest are in a dead terminal state (terminated/banned)",
+                pool.len()
+            )));
+        }
         let events = self
             .client
-            .fetch_events(filter, timeout)
+            .fetch_events_from(fetchable.iter().map(String::as_str), filter, timeout)
             .await
             .map_err(|e| NetError::Client(e.to_string()))?;
         // The check runs on the EMPTY result only, and after the fetch: a non-empty answer proves a
@@ -572,6 +756,11 @@ impl RelayClient {
     /// would pull both and the renderer would prefer the plain-unsplit teaser (its `is_plain_unsplit`
     /// guard). Reading the big relay exclusively keeps the split family intact. Deduped by id; an
     /// empty relay set or a constraint-free filter is refused before the query.
+    ///
+    /// QURATOR-386: the explicit target list is intersected with [`fetchable_relays`] — the same
+    /// exclusion `fetch` applies pool-wide, so a named dead-terminal relay is dropped instead of
+    /// errored against. If nothing fetchable remains, the query is refused
+    /// ([`NetError::NoRelayConnected`]) rather than sent to an empty set.
     pub async fn fetch_from(
         &self,
         relays: &[String],
@@ -584,9 +773,25 @@ impl RelayClient {
         if filter.is_empty() {
             return Err(NetError::EmptyFilter);
         }
+        // Trailing-slash tolerance matches `relay_status`'s pool-key comparison.
+        let live = self.client.relays().await;
+        let pool: Vec<(String, RelayStatus)> =
+            live.iter().map(|(u, r)| (u.to_string(), r.status())).collect();
+        let fetchable = fetchable_relays(&pool);
+        let targets: Vec<String> = relays
+            .iter()
+            .filter(|r| fetchable.iter().any(|u| u.trim_end_matches('/') == r.trim_end_matches('/')))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Err(NetError::NoRelayConnected(format!(
+                "{} target relay(s), none fetchable (all in a dead terminal state)",
+                relays.len()
+            )));
+        }
         let events = self
             .client
-            .fetch_events_from(relays.iter().map(String::as_str), filter, timeout)
+            .fetch_events_from(targets.iter().map(String::as_str), filter, timeout)
             .await
             .map_err(|e| NetError::Client(e.to_string()))?;
         Ok(dedup_by_id(events))
@@ -617,6 +822,8 @@ impl RelayClient {
             relays: relays.to_vec(),
             limiter: Mutex::new(RelayRateLimiter::relay_writes()),
             start: Instant::now(),
+            redial: Mutex::new(HashMap::new()),
+            last_reported: Mutex::new(HashMap::new()),
         }
     }
 
@@ -863,6 +1070,101 @@ mod tests {
         assert!(!pool_is_live(&[]), "no relays = not live");
     }
 
+    // ── Terminated-relay re-dial backoff (QURATOR-385) ─────────────────────────────────────────
+
+    #[test]
+    fn redial_due_first_attempt_is_immediate_then_backoff_doubles_capped() {
+        let now = Instant::now();
+        // The FIRST re-dial is immediate — a relay that just stranded itself must not sit out a
+        // delay before even one rescue attempt.
+        assert!(redial_due(None, 0, now));
+        assert!(redial_due(None, 100, now), "attempt count cannot delay the first re-dial");
+        // 30 s after the 1st attempt, 60 s after the 2nd (exponential doubling)...
+        let back = |secs: u64, attempts: u32| {
+            redial_due(Some(now - Duration::from_secs(secs)), attempts, now)
+        };
+        assert!(!back(29, 1), "29 s after the first attempt the 30 s backoff holds");
+        assert!(back(30, 1), "at exactly 30 s the next re-dial is due");
+        assert!(!back(59, 2), "59 s after the second attempt the 60 s backoff holds");
+        assert!(back(60, 2));
+        // ...doubling on until the 15-minute cap: attempt 6 asks 30 s·2⁵ = 960 s but clamps to
+        // 900 s, so the due boundary sits at exactly 15 min.
+        assert!(!back(899, 6), "899 s into a capped episode the 15 min backoff holds");
+        assert!(back(900, 6));
+        // No overflow at absurd attempt counts (long-lived session, relay never returns): the
+        // schedule saturates to the cap and the shift can never panic.
+        assert!(!back(899, u32::MAX));
+        assert!(back(900, u32::MAX));
+        assert_eq!(redial_backoff_delay(u32::MAX), REDIAL_BACKOFF_CAP);
+        // MUTATION (P-10): make `redial_due` return `false` unconditionally (replace its body
+        // with `false`) → the two `redial_due(None, ..)` asserts above red.
+        // MUTATION (P-10): change `REDIAL_BACKOFF_BASE` to `Duration::ZERO` → the `!back(29, 1)`
+        // assert reds (an immediate re-dial becomes due instantly after attempt 1).
+        // MUTATION (P-10): delete the `.min(REDIAL_BACKOFF_CAP)` clamp in `redial_backoff_delay`
+        // → the `!back(899, 6)` assert reds (960 s > 900 s means not yet due).
+        // MUTATION (P-10): delete the `.min(31)` shift clamp → `redial_backoff_delay(u32::MAX)`
+        // panics on shift overflow → this test reds with the panic.
+    }
+
+    /// The QURATOR-385 sweep through the REAL pool: a refused `ws://127.0.0.1:1` handshake (same
+    /// no-network trick as `fetch_errors_when_no_relay_is_connected`) leaves the relay in
+    /// `RelayStatus::Terminated` — nostr-relay-pool 0.44.3 sets Terminated on a failed FIRST
+    /// handshake and spawns NO reconnect task, which is exactly the stranded shape the sweep
+    /// repairs. The first sweep records the attempt; a second sweep, immediately after the
+    /// spawned dial has had time to fail again, must NOT record another (the 30 s backoff holds).
+    #[tokio::test]
+    async fn terminated_relay_is_redialed_once_then_backoff_holds() {
+        let url = "ws://127.0.0.1:1";
+        let client = Client::builder().build();
+        client.add_relay(url).await.expect("add_relay of a URL is offline bookkeeping");
+        let conn = client.try_connect(Duration::from_millis(500)).await;
+        assert!(conn.success.is_empty(), "the refused handshake must not report success");
+        let rc = RelayClient {
+            client,
+            relays: vec![url.to_string()],
+            limiter: Mutex::new(RelayRateLimiter::relay_writes()),
+            start: Instant::now(),
+            redial: Mutex::new(HashMap::new()),
+            last_reported: Mutex::new(HashMap::new()),
+        };
+        // The failed first handshake must have landed Terminated — the exact stranded state the
+        // sweep exists for (Banned/Connecting/Disconnected are deliberately out of its scope).
+        let status = rc.client.relays().await.values().next().map(|r| r.status());
+        assert!(
+            matches!(status, Some(RelayStatus::Terminated)),
+            "a refused first handshake must leave Terminated in 0.44.3, got {status:?}"
+        );
+        // Sweep 1: the relay is due (first re-dial is immediate) → one attempt recorded, one
+        // dial spawned.
+        rc.redial_terminated_relays().await;
+        let attempts_after_first = {
+            let state = rc.redial.lock().expect("redial backoff lock");
+            assert_eq!(state.len(), 1, "exactly the one terminated relay is tracked");
+            state.values().next().map(|(_, a)| *a)
+        };
+        assert_eq!(attempts_after_first, Some(1), "the first sweep records attempt 1");
+        // Let the spawned dial reach the refused port and fail, so sweep 2 observes the relay
+        // back in Terminated — the backoff must then be the ONLY thing holding the re-dial.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rc.redial_terminated_relays().await;
+        let attempts_after_second = {
+            let state = rc.redial.lock().expect("redial backoff lock");
+            state.values().next().map(|(_, a)| *a)
+        };
+        assert_eq!(
+            attempts_after_second, attempts_after_first,
+            "an immediate second sweep must be held back by the backoff, not re-dial"
+        );
+        // MUTATION (P-10): change the sweep's `RelayStatus::Terminated` match arm to
+        // `_ => {}` for every status → no entry is ever recorded, so the
+        // `state.len() == 1` assert reds.
+        // MUTATION (P-10): make `redial_due` return `true` unconditionally (replace its body
+        // with `true`) → after the settle sleep sweep 2 sees Terminated again and re-dials, so
+        // the `attempts_after_second == attempts_after_first` assert reds (count becomes 2).
+        // MUTATION (P-10): delete the `state.insert(canon.clone(), (now, attempt))` line → the
+        // `attempts_after_first == Some(1)` assert reds (the map stays empty).
+    }
+
     // ── The outage-vs-empty discriminator at the fetch seam (QURATOR-145 review, HIGH) ─────────
 
     #[test]
@@ -1054,26 +1356,34 @@ mod tests {
     /// empty answer; with it, the caller can finally tell an outage from a genuine empty.
     ///
     /// Uses `ws://127.0.0.1:1` (connection refused, nothing listens) so the test needs no relay
-    /// server and no real network egress. The relay lands in Disconnected/reconnect-backoff states,
-    /// never Connected — which is precisely the state the gate refuses on.
+    /// server and no real network egress. The relay cycles Connecting/Disconnected under
+    /// reconnect backoff, never Connected — which is precisely the state the gate refuses on.
+    ///
+    /// QURATOR-386: this must dial via `Client::connect` (spawned task, auto-reconnect), NOT
+    /// `try_connect`. In nostr-relay-pool 0.44.3 a failed `try_connect` lands `Terminated`, which
+    /// `fetch`'s fetchable-subset early return now refuses first — the post-fetch gate would go
+    /// untested (seen 2026-10-20: `if !any_relay_connected` → `if false` stayed GREEN).
+    ///
+    /// MUTATION (P-10): in `fetch`, `if !any_relay_connected(&statuses)` → `if false` → this reds.
     #[tokio::test]
     async fn fetch_errors_when_no_relay_is_connected() {
         let url = "ws://127.0.0.1:1";
         let client = Client::builder().build();
         client.add_relay(url).await.expect("add_relay of a URL is offline bookkeeping");
-        // The handshake fails (port 1 refuses); try_connect reports the failure and the relay
-        // settles into Disconnected with reconnect backoff — the transient state pool_is_live
-        // deliberately tolerates.
-        let conn = client.try_connect(Duration::from_millis(500)).await;
+        client.connect().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let statuses: Vec<RelayStatus> = client.relays().await.values().map(|r| r.status()).collect();
         assert!(
-            conn.success.is_empty(),
-            "the unreachable relay must not report a completed handshake"
+            !statuses.iter().any(|s| matches!(s, RelayStatus::Connected | RelayStatus::Terminated | RelayStatus::Banned)),
+            "the refused relay must be in a transient state (so the post-fetch gate is what refuses), got {statuses:?}"
         );
         let rc = RelayClient {
             client,
             relays: vec![url.to_string()],
             limiter: Mutex::new(RelayRateLimiter::relay_writes()),
             start: Instant::now(),
+            redial: Mutex::new(HashMap::new()),
+            last_reported: Mutex::new(HashMap::new()),
         };
         let filter = Filter::new().kind(Kind::from_u16(hb_core::event::KIND_TEASER)).limit(1);
         let err = rc
@@ -1083,6 +1393,103 @@ mod tests {
         assert!(
             matches!(err, NetError::NoRelayConnected(_)),
             "the outage must be reported as NoRelayConnected, got {err:?}"
+        );
+    }
+
+    // ── QURATOR-386: fetch skips relays in a dead terminal state ────────────────────────────────
+
+    /// MUTATION (P-10): in `fetchable_relays`, delete `RelayStatus::Terminated |` from the
+    /// `matches!` → this test reds (`wss://terminated` reappears in the asserted vec).
+    #[test]
+    fn fetchable_relays_excludes_only_the_dead_terminal_states() {
+        // Every RelayStatus variant, order preserved: only Terminated/Banned drop out ("no retry
+        // will occur" — pool_is_live's reading); every transient state stays because nostr-sdk
+        // owns it and may reconnect.
+        let pool = vec![
+            ("wss://initialized".to_string(), RelayStatus::Initialized),
+            ("wss://pending".to_string(), RelayStatus::Pending),
+            ("wss://connecting".to_string(), RelayStatus::Connecting),
+            ("wss://connected".to_string(), RelayStatus::Connected),
+            ("wss://disconnected".to_string(), RelayStatus::Disconnected),
+            ("wss://terminated".to_string(), RelayStatus::Terminated),
+            ("wss://banned".to_string(), RelayStatus::Banned),
+            ("wss://sleeping".to_string(), RelayStatus::Sleeping),
+        ];
+        assert_eq!(
+            fetchable_relays(&pool),
+            vec![
+                "wss://initialized".to_string(),
+                "wss://pending".to_string(),
+                "wss://connecting".to_string(),
+                "wss://connected".to_string(),
+                "wss://disconnected".to_string(),
+                "wss://sleeping".to_string(),
+            ],
+            "only Terminated/Banned are excluded, and input order is preserved"
+        );
+    }
+
+    #[test]
+    fn fetchable_relays_empty_in_empty_out() {
+        assert!(fetchable_relays(&[]).is_empty(), "an empty pool has no fetchable relays");
+    }
+
+    /// The dead-terminal sibling of [`fetch_errors_when_no_relay_is_connected`]: a relay that has
+    /// been TERMINATED (connection task gone, channel receiver dropped) must leave `fetch`
+    /// refusing with the same [`NetError::NoRelayConnected`] outage variant — never a nostr-sdk
+    /// "can't send message to the 'nostr' channel" error string. `disconnect()` reaches the
+    /// terminal state the failed-handshake path above cannot (that one settles in the transient
+    /// reconnect-backoff Disconnected).
+    ///
+    /// MUTATION (P-10): delete the all-terminated early return in `fetch` AND the post-fetch
+    /// `any_relay_connected` gate → this test reds (an `Ok(vec![])` with no relay able to answer).
+    /// Under EITHER single mutation alone the other gate still refuses (two guards, one None —
+    /// mutate BOTH); the exclusion itself is pinned by
+    /// `fetchable_relays_excludes_only_the_dead_terminal_states` above.
+    #[tokio::test]
+    async fn fetch_refuses_a_pool_whose_only_relay_is_terminated() {
+        let url = "ws://127.0.0.1:1";
+        let client = Client::builder().build();
+        client.add_relay(url).await.expect("add_relay of a URL is offline bookkeeping");
+        let conn = client.try_connect(Duration::from_millis(500)).await;
+        assert!(
+            conn.success.is_empty(),
+            "the unreachable relay must not report a completed handshake"
+        );
+        client.disconnect().await;
+        // The terminal state lands asynchronously: wait (bounded) for it, and refuse to run a
+        // vacuous fetch against a relay that never got there.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let statuses: Vec<RelayStatus> =
+                client.relays().await.values().map(|r| r.status()).collect();
+            if !statuses.is_empty()
+                && statuses.iter().all(|s| matches!(s, RelayStatus::Terminated | RelayStatus::Banned))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "relay never reached a dead terminal state, got {statuses:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let rc = RelayClient {
+            client,
+            relays: vec![url.to_string()],
+            limiter: Mutex::new(RelayRateLimiter::relay_writes()),
+            start: Instant::now(),
+            redial: Mutex::new(HashMap::new()),
+            last_reported: Mutex::new(HashMap::new()),
+        };
+        let filter = Filter::new().kind(Kind::from_u16(hb_core::event::KIND_TEASER)).limit(1);
+        let err = rc
+            .fetch(filter, Duration::from_secs(2))
+            .await
+            .expect_err("an all-terminated pool must be refused, never answered empty");
+        assert!(
+            matches!(err, NetError::NoRelayConnected(_)),
+            "the dead pool must be reported as NoRelayConnected, got {err:?}"
         );
     }
 
@@ -1133,5 +1540,40 @@ mod tests {
         let json = serde_json::to_string(&h).unwrap();
         assert!(json.contains("\"lastError\":null"), "camelCase last_error: {json}");
         assert!(json.contains("\"connected\":false"));
+    }
+
+    // ── QURATOR-387: the dead-terminal WARN fires on the TRANSITION, not on every poll ───────
+    //
+    // `relay_status()` runs on the ~12 s Settings poll; the pre-387 shape logged the WARN on
+    // EVERY call, so one dead relay was a line per poll. The decision lives in the pure
+    // [`should_warn_terminal`], and the full truth table is pinned here.
+    //
+    // MUTATION (P-10): change `should_warn_terminal` to return
+    // `matches!(now, RelayStatus::Terminated | RelayStatus::Banned)` (drop the prev half) →
+    // this test reds: the `Terminated→Terminated` and `Banned→Banned` rows come back true when
+    // they must be false, while the transition-in rows stay green.
+    #[test]
+    fn should_warn_terminal_only_on_transition_into_the_dead_state() {
+        let cases: &[(Option<RelayStatus>, RelayStatus, bool, &str)] = &[
+            (None, RelayStatus::Terminated, true, "first observation of a dead relay warns"),
+            (Some(RelayStatus::Connected), RelayStatus::Terminated, true, "live → dead warns"),
+            (
+                Some(RelayStatus::Terminated),
+                RelayStatus::Terminated,
+                false,
+                "still dead: every 12 s poll must stay quiet",
+            ),
+            (Some(RelayStatus::Banned), RelayStatus::Banned, false, "still banned: quiet"),
+            (
+                Some(RelayStatus::Terminated),
+                RelayStatus::Connected,
+                false,
+                "recovered: the leaving line is INFO, never a WARN",
+            ),
+            (Some(RelayStatus::Connected), RelayStatus::Connected, false, "steady state: quiet"),
+        ];
+        for (prev, now, expected, why) in cases {
+            assert_eq!(should_warn_terminal(*prev, *now), *expected, "{why}: prev={prev:?} now={now:?}");
+        }
     }
 }

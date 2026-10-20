@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, fmt, layer::{Layer, SubscriberExt}, util::SubscriberInitExt};
 
 /// The diagnostic header's privacy contract (INV-2): the npub is TRUNCATED to its first 12 chars,
 /// and neither the browse-key nor the nsec/private key ever appears. One paste must answer "what
@@ -135,6 +135,16 @@ where
 /// `mapping_varies_by_dest_ipv4` from the SAME report through the iroh API (the code consumes
 /// the data, not the log line). Other iroh targets stay at the global `info`.
 ///
+/// **QURATOR-387 — the damus `serviceUrl` AUTH rejection is rate-limited by a per-layer filter,
+/// not by a level.** damus's own SERVER refuses every NIP-42 AUTH — `Can't authenticate to
+/// relay. error: relay needs serviceUrl to be configured before AUTH can work` — and
+/// re-challenges ~every 5 s: **2,225 of the owner's 2026-10-20 log lines in one day**, all of
+/// them the app behaving correctly. A target-level directive cannot demote just that one
+/// message without also hiding genuine `nostr_relay_pool` errors (`Relay receiver exited with
+/// error` must stay visible), so [`AuthNoiseDedup`] — attached to the file layer in [`install`]
+/// — lets through at most ONE per `(url, error)` per 60 minutes and drops the rest. NIP-42 AUTH
+/// itself stays ENABLED (other relays need it); `HB_LOG` still governs levels unchanged.
+///
 /// ⚠ This demotes VOLUME, not content. Relay URLs stay loggable — they are user-configured public
 /// infrastructure. Peer/node addresses are the H4/MT2 harvest shape and are never logged at any
 /// level.
@@ -146,6 +156,118 @@ pub(crate) const DEFAULT_LOG_FILTER: &str = concat!(
     "iroh", "::net_report=error,",
     "info"
 );
+
+/// One `Can't authenticate to relay.` line per `(url, error)` per hour. The relay re-challenges
+/// every ~5 s (720/day); one per hour is enough to date the onset in a user's log while cutting
+/// 99.9% of the noise.
+const AUTH_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Cap on the dedup map's entries; cleared wholesale when reached. Bounded memory by
+/// construction — 256 distinct `(url, error)` pairs is far beyond any real relay set, and a
+/// clear costs at most one extra repeat line per key.
+const AUTH_DEDUP_MAP_CAP: usize = 256;
+
+/// The exact `message` field of the relay-side rejection (the server's text, verbatim from the
+/// owner's 2026-10-20 log). Matching the MESSAGE — not the target alone — is what leaves every
+/// other `nostr_relay_pool` error untouched.
+const AUTH_DEDUP_MESSAGE: &str = "Can't authenticate to relay.";
+
+/// Target PREFIX of the noisy crate. The message check below does the discriminating.
+const AUTH_DEDUP_TARGET_PREFIX: &str = "nostr_relay_pool";
+
+/// The event fields the dedup keys on, read with a [`tracing::field::Visit`]. The relay's
+/// `message` is a static string literal (arrives via `record_str`); `url`/`error` are written
+/// with the `%` sigil, i.e. `Display` values (arrive via `record_debug`, whose `Debug` forwards
+/// to `Display`, so no quoting artefacts). A format-args `message` would arrive quoted via
+/// `record_debug` and simply never equal the literal — safe in the no-match direction.
+#[derive(Default)]
+struct AuthEventFields {
+    message: Option<String>,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+impl tracing::field::Visit for AuthEventFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "message" => self.message = Some(value.to_string()),
+            "url" => self.url = Some(value.to_string()),
+            "error" => self.error = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = Some(rendered),
+            "url" => self.url = Some(rendered),
+            "error" => self.error = Some(rendered),
+            _ => {}
+        }
+    }
+}
+
+/// Per-layer filter (QURATOR-387): rate-limit exactly ONE third-party log line — the relay-side
+/// NIP-42 AUTH rejection whose `message` is [`AUTH_DEDUP_MESSAGE`] under a
+/// [`AUTH_DEDUP_TARGET_PREFIX`] target — to one event per `(url, error)` per
+/// [`AUTH_DEDUP_WINDOW`]. Everything else passes untouched, so genuine `nostr_relay_pool`
+/// errors stay visible; a target-level `EnvFilter` directive could not make that distinction.
+///
+/// Level control stays entirely with the `EnvFilter` (`HB_LOG` still governs); this filter only
+/// dedups, and it applies regardless of any override. Attached to the FILE layer only in
+/// [`install`] — stdout/stderr paths are unaffected.
+///
+/// Never fails: a poisoned map degrades to "keep deduping with whatever state survives"
+/// (`PoisonError::into_inner`), never a panic — the log subscriber must not be able to take the
+/// app down.
+#[derive(Default)]
+pub(crate) struct AuthNoiseDedup {
+    seen: std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for AuthNoiseDedup {
+    fn enabled(
+        &self,
+        _meta: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        // Levels are the EnvFilter's job; this layer is interested in everything it admits and
+        // makes its per-event call in [`Self::event_enabled`].
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        // Fast path: only events under the noisy target can ever be deduped.
+        if !event.metadata().target().starts_with(AUTH_DEDUP_TARGET_PREFIX) {
+            return true;
+        }
+        let mut fields = AuthEventFields::default();
+        event.record(&mut fields);
+        if fields.message.as_deref() != Some(AUTH_DEDUP_MESSAGE) {
+            return true;
+        }
+        let key = (fields.url.unwrap_or_default(), fields.error.unwrap_or_default());
+        let mut seen =
+            self.seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Bound before insert: a map at cap is cleared wholesale rather than evicted per-key.
+        if seen.len() >= AUTH_DEDUP_MAP_CAP {
+            seen.clear();
+        }
+        let now = std::time::Instant::now();
+        match seen.get(&key) {
+            Some(first) if now.duration_since(*first) < AUTH_DEDUP_WINDOW => false,
+            _ => {
+                seen.insert(key, now);
+                true
+            }
+        }
+    }
+}
 
 /// failure returns silently (stderr gets a best-effort line) so the app starts regardless.
 pub(crate) fn install(data_dir: &Path) {
@@ -182,9 +304,12 @@ pub(crate) fn install(data_dir: &Path) {
         // either way — a deliberate, bounded one (one handle, one app).
         std::mem::forget(_guard);
 
+        // QURATOR-387: the dedup rides on the fmt layer as a per-layer `Filter`, NEXT TO (not
+        // inside) the `EnvFilter` — `HB_LOG` still governs levels wholesale, and the dedup
+        // applies regardless of any override.
         let subscriber = tracing_subscriber::registry()
             .with(filter)
-            .with(fmt_layer(non_blocking));
+            .with(fmt_layer(non_blocking).with_filter(AuthNoiseDedup::default()));
         // try_init, not init: init() panics if a global subscriber is already set (e.g. a second
         // install() call, or a test harness that set one), which would violate the never-fail
         // contract above.
@@ -388,6 +513,102 @@ mod tests {
             out.contains("OUR_DEBUG_MARKER"),
             "hb_app DEBUG must survive — demoting the third-party noise must not cost us our own \
              breadcrumbs:\n{out}"
+        );
+    }
+
+    // ── QURATOR-387: the damus `serviceUrl` AUTH-noise dedup ─────────────────────────────────
+    //
+    // The filter must rate-limit ONLY the exact relay rejection (`message` ==
+    // [`AUTH_DEDUP_MESSAGE`] under a `nostr_relay_pool` target) — one per `(url, error)` per
+    // window — and leave every other event untouched. Asserted behaviourally, by emitting
+    // through a subscriber built with the SAME filter shape [`install`] attaches and reading
+    // back what survived.
+
+    /// The capture-writer pattern from [`install_test_subscriber`] / the default-filter test
+    /// above — BufMaker over a shared buffer, per-thread `set_default` — plus the dedup attached
+    /// exactly as production attaches it: `.with_filter(AuthNoiseDedup::…)` on the shared
+    /// [`fmt_layer`], next to an `EnvFilter`.
+    fn dedup_test_subscriber(
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> impl tracing::Subscriber {
+        #[derive(Clone)]
+        struct BufMaker(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for BufMaker {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().map_err(|_| std::io::Error::other("poisoned"))?.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMaker {
+            type Writer = BufMaker;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        tracing_subscriber::registry()
+            .with(EnvFilter::new("trace"))
+            .with(fmt_layer(BufMaker(buf)).with_filter(AuthNoiseDedup::default()))
+    }
+
+    /// MUTATION (P-10): make `AuthNoiseDedup::event_enabled` return `true` unconditionally (drop
+    /// the window check) → this test reds: all 5 identical events reach the log instead of 1.
+    /// The pass-through test below stays green under that mutation — it pins the other
+    /// direction.
+    #[test]
+    fn auth_noise_dedup_lets_exactly_one_serviceurl_auth_error_through() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(dedup_test_subscriber(buf.clone()));
+        // The exact shape from the owner's log: the relay's own server text, ~every 5 s.
+        for _ in 0..5 {
+            tracing::error!(
+                target: "nostr_relay_pool::relay::inner",
+                url = %"wss://relay.damus.io",
+                error = %"error: relay needs serviceUrl to be configured before AUTH can work",
+                "Can't authenticate to relay."
+            );
+        }
+        let out = String::from_utf8(buf.lock().unwrap().clone()).expect("utf8 log");
+        assert_eq!(
+            out.matches(AUTH_DEDUP_MESSAGE).count(),
+            1,
+            "one per (url, error) per window — the re-challenges are dropped:\n{out}"
+        );
+    }
+
+    /// MUTATION (P-10): invert the message guard — return
+    /// `fields.message.as_deref() == Some(AUTH_DEDUP_MESSAGE)` instead of the match-else-pass
+    /// shape (i.e. drop everything that is NOT the AUTH literal) → this test reds: the
+    /// different-url lines and the `Relay receiver exited with error.` lines vanish.
+    #[test]
+    fn auth_noise_dedup_passes_other_relay_pool_events_untouched() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(dedup_test_subscriber(buf.clone()));
+        for i in 0..5 {
+            // Same message, a DIFFERENT url each time — five `(url, error)` keys, five windows:
+            // all pass.
+            tracing::error!(
+                target: "nostr_relay_pool::relay::inner",
+                url = %format!("wss://relay{i}.example"),
+                error = %"error: relay needs serviceUrl to be configured before AUTH can work",
+                "Can't authenticate to relay."
+            );
+            // An unrelated relay ERROR — a genuine failure that must never be deduped away.
+            tracing::error!(target: "nostr_relay_pool::relay::inner", "Relay receiver exited with error.");
+        }
+        let out = String::from_utf8(buf.lock().unwrap().clone()).expect("utf8 log");
+        assert_eq!(
+            out.matches(AUTH_DEDUP_MESSAGE).count(),
+            5,
+            "a different url is a different key — every one passes:\n{out}"
+        );
+        assert_eq!(
+            out.matches("Relay receiver exited with error.").count(),
+            5,
+            "unrelated nostr_relay_pool errors are NEVER deduped — a target-level directive \
+             would have hidden these:\n{out}"
         );
     }
 
